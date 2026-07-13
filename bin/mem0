@@ -1,0 +1,569 @@
+#!/usr/bin/env node
+
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { spawnSync } from 'child_process';
+
+const CONFIG_PATH = path.join(os.homedir(), '.mem0', 'config.json');
+const OFFICIAL_CLI_PATH = '/home/zhaowy313/.nvm/versions/node/v22.22.0/bin/mem0';
+
+// Helper to load config
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Error loading config:', e.message);
+  }
+  return {};
+}
+
+// Helper to save config
+function saveConfig(config) {
+  try {
+    const dir = path.dirname(CONFIG_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Error saving config:', e.message);
+  }
+}
+
+// Fallback to running official Node.js @mem0/cli
+function fallbackToOfficial() {
+  const originalArgs = process.argv.slice(2);
+  const res = spawnSync(OFFICIAL_CLI_PATH, originalArgs, { stdio: 'inherit' });
+  process.exit(res.status || 0);
+}
+
+// Main execution
+async function main() {
+  const config = loadConfig();
+  const apiKey = config.platform?.api_key || 'm0sk_nvQhQI2mFwPGvHoaB1yeK4jgrBX9sWfpBAiW3i1wQ9k';
+  const baseUrl = (config.platform?.base_url || 'https://mem0-api.arisecore.org').replace(/\/+$/, '');
+  const defaultUserId = config.defaults?.user_id || 'zhaowy313';
+
+  const rawArgs = process.argv.slice(2);
+  
+  // 1. Argument and Flag Parsing
+  const parsedArgs = [];
+  const options = {
+    json: false,
+    all: false
+  };
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg === '-u' || arg === '--user-id') {
+      options.userId = rawArgs[++i];
+    } else if (arg === '--agent-id') {
+      options.agentId = rawArgs[++i];
+    } else if (arg === '--run-id') {
+      options.runId = rawArgs[++i];
+    } else if (arg === '--app-id') {
+      options.appId = rawArgs[++i];
+    } else if (arg === '--json' || arg === '--agent') {
+      options.json = true;
+    } else if (arg === '--all') {
+      options.all = true;
+    } else if (arg === '--metadata') {
+      try {
+        options.metadata = JSON.parse(rawArgs[++i]);
+      } catch (e) {
+        handleError(new Error('Invalid JSON string passed to --metadata'));
+      }
+    } else if (arg.startsWith('-')) {
+      // Pass other options as generic flags
+      const key = arg.replace(/^-+/, '');
+      const nextVal = rawArgs[i + 1];
+      if (nextVal && !nextVal.startsWith('-')) {
+        options[key] = nextVal;
+        i++;
+      } else {
+        options[key] = true;
+      }
+    } else {
+      parsedArgs.push(arg);
+    }
+  }
+
+  const command = parsedArgs[0];
+
+  // Defaulting logic:
+  // For 'add', default to defaultUserId if not specified
+  if (command === 'add' && !options.userId) {
+    options.userId = defaultUserId;
+  }
+  // For other commands (list, search, delete), only default to defaultUserId if NO filters (userId/agentId/runId/appId) are specified
+  if (command !== 'add' && !options.userId && !options.agentId && !options.runId && !options.appId) {
+    options.userId = defaultUserId;
+  }
+
+  // 2. Unsupported commands fall back directly to official SaaS platform CLI
+  const supportedCommands = ['status', 'list', 'add', 'search', 'delete', 'update', 'config', 'entity', 'help', '--help', '-h'];
+  if (!command || !supportedCommands.includes(command)) {
+    fallbackToOfficial();
+    return;
+  }
+
+  if (command === 'help' || command === '--help' || command === '-h') {
+    printHelp();
+    return;
+  }
+
+  const headers = {
+    'X-API-Key': apiKey,
+    'Content-Type': 'application/json'
+  };
+
+  // Helper to handle errors gracefully with JSON/Text support
+  function handleError(error, isNetworkError = false) {
+    if (options.json) {
+      console.log(JSON.stringify({ error: error.message, fallback_available: isNetworkError }, null, 2));
+      process.exit(1);
+    } else {
+      console.error(`\n✗ Operation failed: ${error.message}`);
+      if (isNetworkError) {
+        console.log('\n- Attempting to fallback to official Mem0 SaaS CLI...');
+        fallbackToOfficial();
+      } else {
+        process.exit(1);
+      }
+    }
+  }
+
+  try {
+    // === STATUS COMMAND ===
+    if (command === 'status') {
+      if (!options.json) console.log('- Checking connection...');
+      const start = Date.now();
+      try {
+        const resp = await fetch(`${baseUrl}/configure`, { headers });
+        const latency = ((Date.now() - start) / 1000).toFixed(2);
+        
+        if (resp.ok) {
+          if (options.json) {
+            console.log(JSON.stringify({ connected: true, backend: 'self-hosted', base_url: baseUrl, latency: `${latency}s` }, null, 2));
+          } else {
+            console.log(`\n┌ Connection Status ─────────────────────────────┐`);
+            console.log(`│                                                │`);
+            console.log(`│     ● Connected                                │`);
+            console.log(`│     Backend:  self-hosted (vps)                │`);
+            console.log(`│     API URL:  ${baseUrl.padEnd(31)}│`);
+            console.log(`│     Latency:  ${(latency + 's').padEnd(31)}│`);
+            console.log(`│                                                │`);
+            console.log(`└────────────────────────────────────────────────┘\n`);
+          }
+        } else {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+      } catch (e) {
+        handleError(new Error(`Connection failed: ${e.message}`), true);
+      }
+    } 
+    
+    // === LIST COMMAND ===
+    else if (command === 'list') {
+      if (!options.json) {
+        let msg = '- Listing memories';
+        const parts = [];
+        if (options.userId) parts.push(`user_id: "${options.userId}"`);
+        if (options.agentId) parts.push(`agent_id: "${options.agentId}"`);
+        if (options.runId) parts.push(`run_id: "${options.runId}"`);
+        if (options.appId) parts.push(`app_id: "${options.appId}"`);
+        if (parts.length > 0) msg += ` for ${parts.join(', ')}`;
+        msg += '...';
+        console.log(msg);
+      }
+      
+      const queryParams = new URLSearchParams();
+      if (options.userId) queryParams.append('user_id', options.userId);
+      if (options.agentId) queryParams.append('agent_id', options.agentId);
+      if (options.runId) queryParams.append('run_id', options.runId);
+      if (options.appId) queryParams.append('app_id', options.appId);
+
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/memories?${queryParams.toString()}`, { headers });
+      } catch (e) {
+        handleError(e, true);
+        return;
+      }
+
+      if (!resp.ok) {
+        if (resp.status === 401) throw new Error('Unauthorized: Invalid API Key');
+        throw new Error(`HTTP Error ${resp.status}`);
+      }
+
+      const data = await resp.json();
+      const memories = data.results || [];
+      
+      if (options.json) {
+        console.log(JSON.stringify(memories, null, 2));
+      } else {
+        if (memories.length === 0) {
+          console.log('\nNo memories found.');
+          return;
+        }
+        console.log('\nID                                   Memory');
+        console.log('──────────────────────────────────── ────────────────────────────────────────');
+        memories.forEach(m => {
+          const id = m.id.padEnd(36);
+          const text = m.memory;
+          console.log(`${id} ${text}`);
+        });
+        
+        let footer = `\n${memories.length} results`;
+        const parts = [];
+        if (options.userId) parts.push(`user_id=${options.userId}`);
+        if (options.agentId) parts.push(`agent_id=${options.agentId}`);
+        if (options.runId) parts.push(`run_id=${options.runId}`);
+        if (options.appId) parts.push(`app_id=${options.appId}`);
+        if (parts.length > 0) footer += ` · ${parts.join(' · ')}`;
+        console.log(footer);
+      }
+    } 
+    
+    // === ADD COMMAND ===
+    else if (command === 'add') {
+      const text = parsedArgs.slice(1).join(' ');
+      if (!text) {
+        handleError(new Error('Please provide memory text to add.'));
+        return;
+      }
+      
+      if (!options.json) console.log('- Adding memory...');
+      
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/memories`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            messages: [{ role: 'user', content: text }],
+            user_id: options.userId,
+            agent_id: options.agentId,
+            run_id: options.runId,
+            app_id: options.appId,
+            metadata: options.metadata
+          })
+        });
+      } catch (e) {
+        handleError(e, true);
+        return;
+      }
+
+      if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+      const data = await resp.json();
+      const results = data.results || [];
+      
+      if (options.json) {
+        console.log(JSON.stringify({ results }, null, 2));
+      } else {
+        console.log(`\n✓ Memory processed — ${results.length} memory extracted`);
+        results.forEach(r => {
+          console.log(`  + Added       ${r.memory} (${r.id.slice(0, 8)})`);
+        });
+      }
+    } 
+    
+    // === SEARCH COMMAND ===
+    else if (command === 'search') {
+      const query = parsedArgs.slice(1).join(' ');
+      if (!query) {
+        handleError(new Error('Please provide a search query.'));
+        return;
+      }
+      
+      if (!options.json) console.log('- Searching memories...');
+      
+      const filters = { user_id: options.userId };
+      if (options.agentId) filters.agent_id = options.agentId;
+      if (options.runId) filters.run_id = options.runId;
+      if (options.appId) filters.app_id = options.appId;
+      
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/search`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            query,
+            filters
+          })
+        });
+      } catch (e) {
+        handleError(e, true);
+        return;
+      }
+
+      if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+      const data = await resp.json();
+      const results = data.results || [];
+      
+      if (options.json) {
+        console.log(JSON.stringify(results, null, 2));
+      } else {
+        if (results.length === 0) {
+          console.log('\nNo matching memories found.');
+          return;
+        }
+        console.log(`\nFound ${results.length} memories:\n`);
+        results.forEach((r, idx) => {
+          console.log(`  ${idx + 1}. ${r.memory}`);
+          console.log(`     Score: ${r.score.toFixed(2)} · ID: ${r.id.slice(0, 8)}`);
+        });
+      }
+    } 
+    
+    // === UPDATE COMMAND ===
+    else if (command === 'update') {
+      const memoryId = parsedArgs[1];
+      const text = parsedArgs.slice(2).join(' ');
+      
+      if (!memoryId) {
+        handleError(new Error('Usage: mem0 update <memory_id> [text] [--metadata "..."]'));
+        return;
+      }
+
+      if (!text && !options.metadata) {
+        handleError(new Error('Please provide text or --metadata to update.'));
+        return;
+      }
+
+      if (!options.json) console.log(`- Updating memory ID: ${memoryId}...`);
+      
+      const payload = {};
+      if (text) payload.text = text;
+      if (options.metadata) payload.metadata = options.metadata;
+
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/memories/${memoryId}`, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify(payload)
+        });
+      } catch (e) {
+        handleError(e, true);
+        return;
+      }
+
+      if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+      const updated = await resp.json();
+
+      if (options.json) {
+        console.log(JSON.stringify({ success: true, result: updated }, null, 2));
+      } else {
+        console.log('✓ Memory updated successfully.');
+      }
+    }
+
+    // === DELETE COMMAND ===
+    else if (command === 'delete') {
+      const idToDelete = parsedArgs.slice(1).filter(a => !a.startsWith('-'))[0];
+      
+      if (options.all) {
+        if (!options.json) console.log(`- Deleting all memories for user_id: "${options.userId}"...`);
+        const params = new URLSearchParams();
+        params.append('user_id', options.userId);
+        if (options.agentId) params.append('agent_id', options.agentId);
+        if (options.runId) params.append('run_id', options.runId);
+        
+        let resp;
+        try {
+          resp = await fetch(`${baseUrl}/memories?${params.toString()}`, {
+            method: 'DELETE',
+            headers
+          });
+        } catch (e) {
+          handleError(e, true);
+          return;
+        }
+
+        if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+        
+        if (options.json) {
+          console.log(JSON.stringify({ success: true, message: 'All memories matching filters deleted' }, null, 2));
+        } else {
+          console.log('✓ Successfully deleted matching memories.');
+        }
+      } else if (idToDelete) {
+        if (!options.json) console.log(`- Deleting memory ID: ${idToDelete}...`);
+        
+        let resp;
+        try {
+          resp = await fetch(`${baseUrl}/memories/${idToDelete}`, {
+            method: 'DELETE',
+            headers
+          });
+        } catch (e) {
+          handleError(e, true);
+          return;
+        }
+
+        if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+        
+        if (options.json) {
+          console.log(JSON.stringify({ success: true, id: idToDelete }, null, 2));
+        } else {
+          console.log('✓ Memory deleted successfully.');
+        }
+      } else {
+        handleError(new Error('Please specify memory ID to delete, or use --all flag.'));
+      }
+    } 
+    
+    // === ENTITY COMMAND ===
+    else if (command === 'entity') {
+      const sub = parsedArgs[1];
+      if (sub === 'list') {
+        if (!options.json) console.log('- Listing entities...');
+        let resp;
+        try {
+          resp = await fetch(`${baseUrl}/entities`, { headers });
+        } catch (e) {
+          handleError(e, true);
+          return;
+        }
+
+        if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+        const entities = await resp.json();
+
+        if (options.json) {
+          console.log(JSON.stringify(entities, null, 2));
+        } else {
+          if (entities.length === 0) {
+            console.log('No entities found.');
+            return;
+          }
+          console.log('\nID                   Type             Total Memories   Created At');
+          console.log('──────────────────── ──────────────── ──────────────── ────────────────────────');
+          entities.forEach(e => {
+            const id = e.id.padEnd(20);
+            const type = e.type.padEnd(16);
+            const count = String(e.total_memories).padEnd(16);
+            const date = e.created_at ? e.created_at.slice(0, 19) : '—';
+            console.log(`${id} ${type} ${count} ${date}`);
+          });
+        }
+      } else if (sub === 'delete') {
+        const type = parsedArgs[2]; // e.g. user, agent, run
+        const id = parsedArgs[3];
+        if (!type || !id) {
+          handleError(new Error('Usage: mem0 entity delete <user|agent|run> <entity_id>'));
+          return;
+        }
+
+        if (!options.json) console.log(`- Deleting entity "${id}" of type "${type}"...`);
+        let resp;
+        try {
+          resp = await fetch(`${baseUrl}/entities/${type}/${id}`, {
+            method: 'DELETE',
+            headers
+          });
+        } catch (e) {
+          handleError(e, true);
+          return;
+        }
+
+        if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+
+        if (options.json) {
+          console.log(JSON.stringify({ success: true, entity_type: type, entity_id: id }, null, 2));
+        } else {
+          console.log(`✓ Entity "${id}" and all its memories deleted.`);
+        }
+      } else {
+        handleError(new Error('Usage: mem0 entity [list|delete]'));
+      }
+    }
+
+    // === CONFIG COMMAND ===
+    else if (command === 'config') {
+      const sub = parsedArgs[1];
+      if (sub === 'show') {
+        if (options.json) {
+          console.log(JSON.stringify({ defaults: config.defaults, platform: { base_url: baseUrl, api_key: apiKey.slice(0, 8) + '...' } }, null, 2));
+        } else {
+          console.log('\n  ◆ mem0 Configuration (VPS Wrapper)\n');
+          console.log(`  defaults.user_id   │  ${options.userId}`);
+          console.log(`  platform.api_key   │  ${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`);
+          console.log(`  platform.base_url  │  ${baseUrl}`);
+          console.log('');
+        }
+      } else if (sub === 'set') {
+        const key = parsedArgs[2];
+        const val = parsedArgs[3];
+        if (!key || !val) {
+          handleError(new Error('Usage: mem0 config set <key> <value>'));
+          return;
+        }
+        
+        const current = config;
+        if (key === 'defaults.user_id') {
+          current.defaults = current.defaults || {};
+          current.defaults.user_id = val;
+        } else if (key === 'platform.base_url') {
+          current.platform = current.platform || {};
+          current.platform.base_url = val;
+        } else if (key === 'platform.api_key') {
+          current.platform = current.platform || {};
+          current.platform.api_key = val;
+        } else {
+          handleError(new Error(`Key "${key}" not supported by this wrapper.`));
+          return;
+        }
+        saveConfig(current);
+        if (options.json) {
+          console.log(JSON.stringify({ success: true, key, value: val }, null, 2));
+        } else {
+          console.log(`✓ ${key} = ${val}`);
+        }
+      } else {
+        handleError(new Error('Usage: mem0 config [show|set]'));
+      }
+    } 
+  } catch (error) {
+    handleError(error);
+  }
+}
+
+function printHelp() {
+  console.log(`
+ Usage: mem0 <command> [options]
+
+ ◆ Mem0 VPS CLI Wrapper (Zero-Dependency)
+ 
+ Exposes standard mem0 commands mapped to your self-hosted VPS server.
+
+ Memory:
+   add "[text]"           Add a memory
+   search "[query]"       Search memories semantically
+   list                   List memories for the current user
+   update [id] [text]     Update memory content
+   delete [id]            Delete a specific memory ID
+   delete --all           Cascade delete all memories matching filters
+
+ Management:
+   status                 Check connection to VPS
+   config show            Display current configuration
+   config set <key> <val> Set configuration value (e.g. platform.base_url)
+   entity list            List all user, agent, and run entities
+   entity delete <type> <id> Delete an entity and its memories
+
+ Options:
+   -u, --user-id <id>     Specify user/project ID (default: zhaowy313)
+   --agent-id <id>        Specify agent/sub-task ID
+   --run-id <id>          Specify run/session ID
+   --app-id <id>          Specify app ID
+   --metadata "<json>"    Pass metadata json string
+   --json, --agent        Output machine-readable JSON format
+  `);
+}
+
+main();

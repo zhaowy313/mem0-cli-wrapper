@@ -1,0 +1,22 @@
+{
+  "name": "mem0-cli-wrapper",
+  "version": "1.0.0",
+  "description": "A zero-dependency Node.js CLI wrapper for self-hosted Mem0 (FastAPI REST backend)",
+  "main": "bin/mem0",
+  "type": "module",
+  "bin": {
+    "mem0": "./bin/mem0"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "mem0",
+    "cli",
+    "wrapper",
+    "self-hosted",
+    "vps"
+  ],
+  "author": "zhaowy313",
+  "license": "MIT"
+}
