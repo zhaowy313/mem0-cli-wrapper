@@ -4,9 +4,23 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const CONFIG_PATH = path.join(os.homedir(), '.mem0', 'config.json');
-const OFFICIAL_CLI_PATH = '/home/zhaowy313/.nvm/versions/node/v22.22.0/bin/mem0';
+
+// Read wrapper version from package.json
+function getWrapperVersion() {
+  try {
+    const pkgPath = path.join(__dirname, '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    return pkg.version || '0.0.0';
+  } catch (e) {
+    return '0.0.0';
+  }
+}
 
 // Helper to load config
 function loadConfig() {
@@ -33,19 +47,158 @@ function saveConfig(config) {
   }
 }
 
-// Fallback to running official Node.js @mem0/cli
+// Read stdin if piped (non-TTY)
+async function readStdin() {
+  if (process.stdin.isTTY) return null;
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('readable', () => {
+      let chunk;
+      while ((chunk = process.stdin.read()) !== null) {
+        data += chunk;
+      }
+    });
+    process.stdin.on('end', () => {
+      resolve(data.trim() || null);
+    });
+    process.stdin.on('error', () => {
+      resolve(null);
+    });
+    // Safety timeout: if stdin hangs (e.g., no pipe and not a TTY on some platforms)
+    setTimeout(() => { resolve(data.trim() || null); }, 500);
+  });
+}
+
+// Function to locate official mem0 CLI dynamically across platforms
+function findOfficialCliPath() {
+  // 1. Try to find via global npm modules first
+  try {
+    const npmRoot = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['root', '-g'], { encoding: 'utf8', timeout: 5000 }).stdout?.trim();
+    if (npmRoot) {
+      const pkgPath = path.join(npmRoot, '@mem0', 'cli');
+      const pkgJsonPath = path.join(pkgPath, 'package.json');
+      if (fs.existsSync(pkgJsonPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+        const binPath = typeof pkg.bin === 'string' ? pkg.bin : (pkg.bin?.mem0 || pkg.bin?.['mem0-cli']);
+        if (binPath) {
+          const fullPath = path.resolve(pkgPath, binPath);
+          if (fs.existsSync(fullPath)) {
+            return { type: 'node', path: fullPath };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore npm search errors
+  }
+
+  // 2. Try to find in system PATH, excluding the current wrapper's folder to avoid infinite recursion
+  const wrapperBinDir = path.resolve(__dirname);
+  const wrapperRootDir = path.resolve(path.join(__dirname, '..'));
+  const pathSeparator = process.platform === 'win32' ? ';' : ':';
+  const pathDirs = (process.env.PATH || '').split(pathSeparator);
+  const exeNames = process.platform === 'win32' ? ['mem0.exe', 'mem0.cmd', 'mem0.bat', 'mem0'] : ['mem0'];
+
+  for (const dir of pathDirs) {
+    if (!dir) continue;
+    try {
+      const resolvedDir = path.resolve(dir);
+      if (resolvedDir.startsWith(wrapperBinDir) || resolvedDir.startsWith(wrapperRootDir)) {
+        continue;
+      }
+      for (const exe of exeNames) {
+        const fullPath = path.join(resolvedDir, exe);
+        if (fs.existsSync(fullPath)) {
+          return { type: 'binary', path: fullPath };
+        }
+      }
+    } catch (e) {
+      // Ignore invalid path formats
+    }
+  }
+
+  return null;
+}
+
+// Fallback to running official Node.js @mem0/cli or pip mem0-cli
 function fallbackToOfficial() {
   const originalArgs = process.argv.slice(2);
-  const res = spawnSync(OFFICIAL_CLI_PATH, originalArgs, { stdio: 'inherit' });
+  const official = findOfficialCliPath();
+  if (!official) {
+    console.error('\n✗ Error: Official Mem0 CLI not found on this system.');
+    console.error('This command is not supported by the VPS wrapper and requires the official CLI.');
+    console.error('Please install it first using:');
+    console.error('  npm install -g @mem0/cli  (Node.js version)');
+    console.error('  or');
+    console.error('  pip install mem0-cli      (Python version)');
+    process.exit(1);
+  }
+
+  let res;
+  if (official.type === 'node') {
+    res = spawnSync(process.execPath, [official.path, ...originalArgs], { stdio: 'inherit', timeout: 30000 });
+  } else {
+    res = spawnSync(official.path, originalArgs, { stdio: 'inherit', shell: process.platform === 'win32', timeout: 30000 });
+  }
   process.exit(res.status || 0);
+}
+
+// Robust JSON parsing for --metadata / --filter (handles Windows/PowerShell quoting quirks)
+function parseJsonArg(rawArgs, startIndex) {
+  const raw = rawArgs[startIndex];
+  if (!raw) return { value: null, consumed: 0 };
+
+  // Attempt 1: Direct parse
+  try {
+    return { value: JSON.parse(raw), consumed: 1 };
+  } catch (e) { /* continue */ }
+
+  // Attempt 2: Strip surrounding single quotes (PowerShell literal strings may pass through)
+  try {
+    const stripped = raw.replace(/^'+|'+$/g, '');
+    return { value: JSON.parse(stripped), consumed: 1 };
+  } catch (e) { /* continue */ }
+
+  // Attempt 3: Handle PowerShell backslash-escaped quotes: {\\\"key\\\":\\\"val\\\"}
+  try {
+    const unescaped = raw.replace(/\\+"/g, '"').replace(/^'+|'+$/g, '');
+    return { value: JSON.parse(unescaped), consumed: 1 };
+  } catch (e) { /* continue */ }
+
+  // Attempt 3: The JSON may have been split across multiple argv entries by the shell.
+  // Try concatenating subsequent args until we find valid JSON or hit a flag.
+  let combined = raw;
+  let extra = 0;
+  for (let j = startIndex + 1; j < rawArgs.length; j++) {
+    const next = rawArgs[j];
+    // Stop if we hit another flag (but allow negative numbers like -1)
+    if (next.startsWith('--') || (next.startsWith('-') && next.length > 1 && isNaN(Number(next)))) {
+      break;
+    }
+    combined += ' ' + next;
+    extra++;
+    try {
+      return { value: JSON.parse(combined), consumed: 1 + extra };
+    } catch (e) { /* continue combining */ }
+  }
+
+  // Attempt 4: Try stripping all outer quotes from combined string
+  try {
+    const stripped = combined.replace(/^["']+|["']+$/g, '');
+    return { value: JSON.parse(stripped), consumed: 1 + extra };
+  } catch (e) { /* give up */ }
+
+  return { value: null, consumed: 1, error: `Invalid JSON: ${raw}` };
 }
 
 // Main execution
 async function main() {
   const config = loadConfig();
-  const apiKey = config.platform?.api_key || 'm0sk_nvQhQI2mFwPGvHoaB1yeK4jgrBX9sWfpBAiW3i1wQ9k';
-  const baseUrl = (config.platform?.base_url || 'https://mem0-api.arisecore.org').replace(/\/+$/, '');
-  const defaultUserId = config.defaults?.user_id || 'zhaowy313';
+  // Support MEM0_API_KEY env var override (same as official CLI)
+  const apiKey = process.env.MEM0_API_KEY || config.platform?.api_key || '';
+  const baseUrl = (process.env.MEM0_BASE_URL || config.platform?.base_url || 'http://localhost:8000').replace(/\/+$/, '');
+  const defaultUserId = config.defaults?.user_id || os.userInfo().username || 'default_user';
 
   const rawArgs = process.argv.slice(2);
   
@@ -55,6 +208,8 @@ async function main() {
     json: false,
     all: false
   };
+  let metadataParseError = null;
+  let filterParseError = null;
 
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i];
@@ -70,12 +225,30 @@ async function main() {
       options.json = true;
     } else if (arg === '--all') {
       options.all = true;
+    } else if (arg === '-k' || arg === '--limit') {
+      options.limit = parseInt(rawArgs[++i], 10);
+    } else if (arg === '--page') {
+      options.page = parseInt(rawArgs[++i], 10);
+    } else if (arg === '--page-size') {
+      options.pageSize = parseInt(rawArgs[++i], 10);
+    } else if (arg === '--output-type') {
+      options.outputType = rawArgs[++i];
     } else if (arg === '--metadata') {
-      try {
-        options.metadata = JSON.parse(rawArgs[++i]);
-      } catch (e) {
-        handleError(new Error('Invalid JSON string passed to --metadata'));
+      const result = parseJsonArg(rawArgs, i + 1);
+      if (result.error) {
+        metadataParseError = result.error;
+      } else {
+        options.metadata = result.value;
       }
+      i += result.consumed;
+    } else if (arg === '--filter') {
+      const result = parseJsonArg(rawArgs, i + 1);
+      if (result.error) {
+        filterParseError = result.error;
+      } else {
+        options.filter = result.value;
+      }
+      i += result.consumed;
     } else if (arg.startsWith('-')) {
       // Pass other options as generic flags
       const key = arg.replace(/^-+/, '');
@@ -103,16 +276,57 @@ async function main() {
     options.userId = defaultUserId;
   }
 
-  // 2. Unsupported commands fall back directly to official SaaS platform CLI
-  const supportedCommands = ['status', 'list', 'add', 'search', 'delete', 'update', 'config', 'entity', 'help', '--help', '-h'];
-  if (!command || !supportedCommands.includes(command)) {
+  // 2. Supported commands — handle locally; unsupported ones fall back to official CLI
+  const supportedCommands = [
+    'status', 'list', 'get', 'add', 'search', 'delete', 'update',
+    'config', 'entity', 'version', 'whoami',
+    'help', '--help', '-h'
+  ];
+
+  // No command → show help (not fallback)
+  if (!command) {
+    printHelp(defaultUserId);
+    return;
+  }
+
+  if (!supportedCommands.includes(command)) {
     fallbackToOfficial();
     return;
   }
 
   if (command === 'help' || command === '--help' || command === '-h') {
-    printHelp();
+    printHelp(defaultUserId);
     return;
+  }
+
+  // === VERSION COMMAND (local only, no network) ===
+  if (command === 'version') {
+    const version = getWrapperVersion();
+    if (options.json) {
+      console.log(JSON.stringify({ version, variant: 'vps-wrapper' }, null, 2));
+    } else {
+      console.log(`mem0-cli-wrapper v${version} (self-hosted VPS variant)`);
+    }
+    return;
+  }
+
+  // === WHOAMI COMMAND (local only, no network) ===
+  if (command === 'whoami') {
+    if (options.json) {
+      console.log(JSON.stringify({ user_id: defaultUserId, base_url: baseUrl }, null, 2));
+    } else {
+      console.log(defaultUserId);
+    }
+    return;
+  }
+
+  // Check API key before making network requests
+  if (!apiKey) {
+    console.error('\n✗ Error: No API key configured.');
+    console.error('Set it via:');
+    console.error('  mem0 config set platform.api_key "your_api_key"');
+    console.error('  or set the MEM0_API_KEY environment variable.');
+    process.exit(1);
   }
 
   const headers = {
@@ -149,14 +363,21 @@ async function main() {
           if (options.json) {
             console.log(JSON.stringify({ connected: true, backend: 'self-hosted', base_url: baseUrl, latency: `${latency}s` }, null, 2));
           } else {
-            console.log(`\n┌ Connection Status ─────────────────────────────┐`);
-            console.log(`│                                                │`);
-            console.log(`│     ● Connected                                │`);
-            console.log(`│     Backend:  self-hosted (vps)                │`);
-            console.log(`│     API URL:  ${baseUrl.padEnd(31)}│`);
-            console.log(`│     Latency:  ${(latency + 's').padEnd(31)}│`);
-            console.log(`│                                                │`);
-            console.log(`└────────────────────────────────────────────────┘\n`);
+            // Dynamic-width status box
+            const lines = [
+              '● Connected',
+              `Backend:  self-hosted (vps)`,
+              `API URL:  ${baseUrl}`,
+              `Latency:  ${latency}s`,
+            ];
+            const maxLen = Math.max(...lines.map(l => l.length));
+            const boxWidth = maxLen + 10; // padding
+            const pad = (s) => s.padEnd(boxWidth - 6);
+            console.log(`\n┌ Connection Status ${'─'.repeat(boxWidth - 21)}┐`);
+            console.log(`│${' '.repeat(boxWidth - 2)}│`);
+            lines.forEach(l => console.log(`│     ${pad(l)}│`));
+            console.log(`│${' '.repeat(boxWidth - 2)}│`);
+            console.log(`└${'─'.repeat(boxWidth - 2)}┘\n`);
           }
         } else {
           throw new Error(`HTTP ${resp.status}`);
@@ -185,6 +406,8 @@ async function main() {
       if (options.agentId) queryParams.append('agent_id', options.agentId);
       if (options.runId) queryParams.append('run_id', options.runId);
       if (options.appId) queryParams.append('app_id', options.appId);
+      if (options.page) queryParams.append('page', options.page);
+      if (options.pageSize) queryParams.append('page_size', options.pageSize);
 
       let resp;
       try {
@@ -223,16 +446,74 @@ async function main() {
         if (options.agentId) parts.push(`agent_id=${options.agentId}`);
         if (options.runId) parts.push(`run_id=${options.runId}`);
         if (options.appId) parts.push(`app_id=${options.appId}`);
+        if (options.page) parts.push(`page=${options.page}`);
+        if (options.pageSize) parts.push(`page_size=${options.pageSize}`);
         if (parts.length > 0) footer += ` · ${parts.join(' · ')}`;
         console.log(footer);
       }
     } 
     
+    // === GET COMMAND (single memory by ID) ===
+    else if (command === 'get') {
+      const memoryId = parsedArgs[1];
+      if (!memoryId) {
+        handleError(new Error('Usage: mem0 get <memory_id>'));
+        return;
+      }
+
+      if (!options.json) console.log(`- Fetching memory ID: ${memoryId}...`);
+
+      let resp;
+      try {
+        resp = await fetch(`${baseUrl}/memories/${memoryId}`, { headers });
+      } catch (e) {
+        handleError(e, true);
+        return;
+      }
+
+      if (!resp.ok) {
+        if (resp.status === 404) throw new Error(`Memory not found: ${memoryId}`);
+        throw new Error(`HTTP Error ${resp.status}`);
+      }
+
+      const memory = await resp.json();
+
+      if (options.json) {
+        console.log(JSON.stringify(memory, null, 2));
+      } else {
+        console.log(`\nID:         ${memory.id}`);
+        console.log(`Memory:     ${memory.memory}`);
+        if (memory.user_id) console.log(`User ID:    ${memory.user_id}`);
+        if (memory.agent_id) console.log(`Agent ID:   ${memory.agent_id}`);
+        if (memory.run_id) console.log(`Run ID:     ${memory.run_id}`);
+        if (memory.app_id) console.log(`App ID:     ${memory.app_id}`);
+        if (memory.metadata) console.log(`Metadata:   ${JSON.stringify(memory.metadata)}`);
+        if (memory.created_at) console.log(`Created:    ${memory.created_at.slice(0, 19)}`);
+        if (memory.updated_at) console.log(`Updated:    ${memory.updated_at.slice(0, 19)}`);
+        console.log('');
+      }
+    }
+
     // === ADD COMMAND ===
     else if (command === 'add') {
-      const text = parsedArgs.slice(1).join(' ');
+      // Check for metadata parse error
+      if (metadataParseError) {
+        handleError(new Error(metadataParseError));
+        return;
+      }
+
+      let text = parsedArgs.slice(1).join(' ');
+
+      // Support stdin pipe input: echo "text" | mem0 add
       if (!text) {
-        handleError(new Error('Please provide memory text to add.'));
+        const stdinData = await readStdin();
+        if (stdinData) {
+          text = stdinData;
+        }
+      }
+
+      if (!text) {
+        handleError(new Error('Please provide memory text to add.\nUsage: mem0 add "your memory text"\n   or: echo "text" | mem0 add'));
         return;
       }
       
@@ -266,13 +547,20 @@ async function main() {
       } else {
         console.log(`\n✓ Memory processed — ${results.length} memory extracted`);
         results.forEach(r => {
-          console.log(`  + Added       ${r.memory} (${r.id.slice(0, 8)})`);
+          const event = r.event || 'ADD';
+          console.log(`  + ${event.padEnd(10)} ${r.memory} (${r.id.slice(0, 8)})`);
         });
       }
     } 
     
     // === SEARCH COMMAND ===
     else if (command === 'search') {
+      // Check for filter parse error
+      if (filterParseError) {
+        handleError(new Error(filterParseError));
+        return;
+      }
+
       const query = parsedArgs.slice(1).join(' ');
       if (!query) {
         handleError(new Error('Please provide a search query.'));
@@ -281,20 +569,30 @@ async function main() {
       
       if (!options.json) console.log('- Searching memories...');
       
-      const filters = { user_id: options.userId };
+      // Build filters object
+      const filters = {};
+      if (options.userId) filters.user_id = options.userId;
       if (options.agentId) filters.agent_id = options.agentId;
       if (options.runId) filters.run_id = options.runId;
       if (options.appId) filters.app_id = options.appId;
+
+      // Build request body
+      const searchBody = { query, filters };
+      // Support --limit / -k (top_k)
+      if (options.limit && !isNaN(options.limit)) {
+        searchBody.top_k = options.limit;
+      }
+      // Support --filter for advanced JSON filter
+      if (options.filter) {
+        searchBody.filters = { ...filters, ...options.filter };
+      }
       
       let resp;
       try {
         resp = await fetch(`${baseUrl}/search`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({
-            query,
-            filters
-          })
+          body: JSON.stringify(searchBody)
         });
       } catch (e) {
         handleError(e, true);
@@ -315,13 +613,20 @@ async function main() {
         console.log(`\nFound ${results.length} memories:\n`);
         results.forEach((r, idx) => {
           console.log(`  ${idx + 1}. ${r.memory}`);
-          console.log(`     Score: ${r.score.toFixed(2)} · ID: ${r.id.slice(0, 8)}`);
+          const scorePart = r.score !== undefined ? `Score: ${r.score.toFixed(2)} · ` : '';
+          console.log(`     ${scorePart}ID: ${r.id.slice(0, 8)}`);
         });
       }
     } 
     
     // === UPDATE COMMAND ===
     else if (command === 'update') {
+      // Check for metadata parse error
+      if (metadataParseError) {
+        handleError(new Error(metadataParseError));
+        return;
+      }
+
       const memoryId = parsedArgs[1];
       const text = parsedArgs.slice(2).join(' ');
       
@@ -370,9 +675,10 @@ async function main() {
       if (options.all) {
         if (!options.json) console.log(`- Deleting all memories for user_id: "${options.userId}"...`);
         const params = new URLSearchParams();
-        params.append('user_id', options.userId);
+        if (options.userId) params.append('user_id', options.userId);
         if (options.agentId) params.append('agent_id', options.agentId);
         if (options.runId) params.append('run_id', options.runId);
+        if (options.appId) params.append('app_id', options.appId);
         
         let resp;
         try {
@@ -406,7 +712,10 @@ async function main() {
           return;
         }
 
-        if (!resp.ok) throw new Error(`HTTP Error ${resp.status}`);
+        if (!resp.ok) {
+          if (resp.status === 404) throw new Error(`Memory not found: ${idToDelete}`);
+          throw new Error(`HTTP Error ${resp.status}`);
+        }
         
         if (options.json) {
           console.log(JSON.stringify({ success: true, id: idToDelete }, null, 2));
@@ -437,25 +746,25 @@ async function main() {
         if (options.json) {
           console.log(JSON.stringify(entities, null, 2));
         } else {
-          if (entities.length === 0) {
+          if (!Array.isArray(entities) || entities.length === 0) {
             console.log('No entities found.');
             return;
           }
           console.log('\nID                   Type             Total Memories   Created At');
           console.log('──────────────────── ──────────────── ──────────────── ────────────────────────');
           entities.forEach(e => {
-            const id = e.id.padEnd(20);
-            const type = e.type.padEnd(16);
-            const count = String(e.total_memories).padEnd(16);
+            const id = String(e.id || '—').padEnd(20);
+            const type = String(e.type || '—').padEnd(16);
+            const count = String(e.total_memories ?? '—').padEnd(16);
             const date = e.created_at ? e.created_at.slice(0, 19) : '—';
             console.log(`${id} ${type} ${count} ${date}`);
           });
         }
       } else if (sub === 'delete') {
-        const type = parsedArgs[2]; // e.g. user, agent, run
+        const type = parsedArgs[2]; // e.g. user, agent, run, app
         const id = parsedArgs[3];
         if (!type || !id) {
-          handleError(new Error('Usage: mem0 entity delete <user|agent|run> <entity_id>'));
+          handleError(new Error('Usage: mem0 entity delete <user|agent|run|app> <entity_id>'));
           return;
         }
 
@@ -488,13 +797,45 @@ async function main() {
       const sub = parsedArgs[1];
       if (sub === 'show') {
         if (options.json) {
-          console.log(JSON.stringify({ defaults: config.defaults, platform: { base_url: baseUrl, api_key: apiKey.slice(0, 8) + '...' } }, null, 2));
+          console.log(JSON.stringify({
+            defaults: config.defaults,
+            platform: { base_url: baseUrl, api_key: apiKey ? apiKey.slice(0, 8) + '...' : '(not set)' }
+          }, null, 2));
         } else {
           console.log('\n  ◆ mem0 Configuration (VPS Wrapper)\n');
-          console.log(`  defaults.user_id   │  ${options.userId}`);
-          console.log(`  platform.api_key   │  ${apiKey.slice(0, 8)}...${apiKey.slice(-4)}`);
+          console.log(`  defaults.user_id   │  ${defaultUserId}`);
+          console.log(`  platform.api_key   │  ${apiKey ? apiKey.slice(0, 8) + '...' + apiKey.slice(-4) : '(not set)'}`);
           console.log(`  platform.base_url  │  ${baseUrl}`);
+          console.log(`  config file        │  ${CONFIG_PATH}`);
           console.log('');
+        }
+      } else if (sub === 'get') {
+        const key = parsedArgs[2];
+        if (!key) {
+          handleError(new Error('Usage: mem0 config get <key>\nAvailable keys: defaults.user_id, platform.base_url, platform.api_key'));
+          return;
+        }
+        let value;
+        if (key === 'defaults.user_id' || key === 'user_id') {
+          value = defaultUserId;
+        } else if (key === 'platform.base_url' || key === 'base_url') {
+          value = baseUrl;
+        } else if (key === 'platform.api_key' || key === 'api_key') {
+          value = apiKey || '(not set)';
+        } else {
+          handleError(new Error(`Unknown config key: "${key}"`));
+          return;
+        }
+        if (options.json) {
+          console.log(JSON.stringify({ key, value }, null, 2));
+        } else {
+          console.log(value);
+        }
+      } else if (sub === 'path') {
+        if (options.json) {
+          console.log(JSON.stringify({ path: CONFIG_PATH }, null, 2));
+        } else {
+          console.log(CONFIG_PATH);
         }
       } else if (sub === 'set') {
         const key = parsedArgs[2];
@@ -515,7 +856,7 @@ async function main() {
           current.platform = current.platform || {};
           current.platform.api_key = val;
         } else {
-          handleError(new Error(`Key "${key}" not supported by this wrapper.`));
+          handleError(new Error(`Key "${key}" not supported by this wrapper.\nSupported: defaults.user_id, platform.base_url, platform.api_key`));
           return;
         }
         saveConfig(current);
@@ -525,7 +866,7 @@ async function main() {
           console.log(`✓ ${key} = ${val}`);
         }
       } else {
-        handleError(new Error('Usage: mem0 config [show|set]'));
+        handleError(new Error('Usage: mem0 config [show|get|set|path]'));
       }
     } 
   } catch (error) {
@@ -533,36 +874,53 @@ async function main() {
   }
 }
 
-function printHelp() {
+function printHelp(defaultUserId) {
+  const version = getWrapperVersion();
   console.log(`
  Usage: mem0 <command> [options]
 
- ◆ Mem0 VPS CLI Wrapper (Zero-Dependency)
+ ◆ Mem0 VPS CLI Wrapper v${version} (Zero-Dependency)
  
  Exposes standard mem0 commands mapped to your self-hosted VPS server.
 
  Memory:
-   add "[text]"           Add a memory
+   add "[text]"           Add a memory (also supports stdin pipe)
+   get <id>               Get a specific memory by ID
    search "[query]"       Search memories semantically
    list                   List memories for the current user
-   update [id] [text]     Update memory content
-   delete [id]            Delete a specific memory ID
+   update <id> [text]     Update memory content
+   delete <id>            Delete a specific memory ID
    delete --all           Cascade delete all memories matching filters
 
  Management:
    status                 Check connection to VPS
    config show            Display current configuration
+   config get <key>       Get a specific config value
    config set <key> <val> Set configuration value (e.g. platform.base_url)
+   config path            Print config file path
    entity list            List all user, agent, and run entities
    entity delete <type> <id> Delete an entity and its memories
 
+ Info:
+   version                Show wrapper version
+   whoami                 Show current default user ID
+   help                   Show this help message
+
  Options:
-   -u, --user-id <id>     Specify user/project ID (default: zhaowy313)
+   -u, --user-id <id>     Specify user/project ID (default: ${defaultUserId})
    --agent-id <id>        Specify agent/sub-task ID
    --run-id <id>          Specify run/session ID
    --app-id <id>          Specify app ID
    --metadata "<json>"    Pass metadata json string
+   --filter "<json>"      Pass advanced search filter (JSON)
+   -k, --limit <n>        Max search results to return (top-k)
+   --page <n>             Page number for list pagination
+   --page-size <n>        Results per page for list pagination
    --json, --agent        Output machine-readable JSON format
+
+ Environment Variables:
+   MEM0_API_KEY           Override configured API key
+   MEM0_BASE_URL          Override configured base URL
   `);
 }
 
